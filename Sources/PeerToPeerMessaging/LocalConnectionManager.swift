@@ -55,6 +55,9 @@ public final class LocalConnectionManager {
 
     public private(set) var state: ConnectionState = .disconnected
 
+    /// Name of the currently connected peer (set on connect, cleared on disconnect)
+    public private(set) var connectedPeerName: String?
+
     /// Available peers discovered
     public private(set) var availablePeers: [NWBrowser.Result] = []
 
@@ -119,6 +122,7 @@ public final class LocalConnectionManager {
         }
 
         logger.info("🔵 Service details - name: \(name), type: \(type), domain: \(domain)")
+        connectedPeerName = name
 
         let parameters = NWParameters.tcp
         parameters.includePeerToPeer = true
@@ -219,9 +223,11 @@ public final class LocalConnectionManager {
                     self.logger.error("Connection failed: \(error.localizedDescription)")
                     self.state = .disconnected
                     self.connection = nil
+                    self.connectedPeerName = nil
                 case .cancelled:
                     self.state = .disconnected
                     self.connection = nil
+                    self.connectedPeerName = nil
                 default:
                     break
                 }
@@ -231,7 +237,7 @@ public final class LocalConnectionManager {
 
     private func receiveMessage() {
         // Receive message length (4 bytes)
-        connection?.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, isComplete, error in
+        connection?.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
             guard let self, let data, error == nil else {
                 if let error {
                     self?.logger.error("Receive error: \(error.localizedDescription)")
@@ -241,8 +247,15 @@ public final class LocalConnectionManager {
 
             let length = data.withUnsafeBytes { $0.load(as: UInt32.self) }
 
-            // Receive actual message
-            self.connection?.receive(minimumIncompleteLength: Int(length), maximumLength: Int(length)) { [weak self] messageData, _, _, error in
+            // Sanity-check to avoid waiting forever on a corrupt length value
+            guard length > 0, length < 10_000_000 else {
+                self.logger.error("Invalid message length \(length) — skipping and reconnecting receive loop")
+                self.receiveMessage()
+                return
+            }
+
+            // Receive actual message — use inner isComplete, not the header's
+            self.connection?.receive(minimumIncompleteLength: Int(length), maximumLength: Int(length)) { [weak self] messageData, _, isComplete, error in
                 guard let self, let messageData, error == nil else {
                     if let error {
                         self?.logger.error("Receive message error: \(error.localizedDescription)")
@@ -254,7 +267,6 @@ public final class LocalConnectionManager {
                     guard let self else { return }
                     await self.onMessageReceived?(messageData)
 
-                    // Continue receiving
                     if !isComplete {
                         self.receiveMessage()
                     }
@@ -270,24 +282,17 @@ public final class LocalConnectionManager {
             return
         }
 
-        // Send length prefix
+        // Prepend length and payload into a single packet so they are always
+        // sent atomically. Two separate sends could interleave with another
+        // concurrent send and corrupt the length-framing on the receiver.
         var length = UInt32(data.count)
-        let lengthData = Data(bytes: &length, count: 4)
+        var packet = Data(bytes: &length, count: 4)
+        packet.append(data)
 
-        connection.send(content: lengthData, completion: .contentProcessed { [weak self] error in
+        connection.send(content: packet, completion: .contentProcessed { [weak self] error in
             if let error {
-                self?.logger.error("Send length error: \(error.localizedDescription)")
-                return
+                self?.logger.error("Send error: \(error.localizedDescription)")
             }
-
-            // Send actual data
-            connection.send(content: data, completion: .contentProcessed { [weak self] error in
-                if let error {
-                    self?.logger.error("Send data error: \(error.localizedDescription)")
-                } else {
-                    self?.logger.info("Message sent successfully")
-                }
-            })
         })
     }
 
@@ -295,9 +300,9 @@ public final class LocalConnectionManager {
     public func disconnect() {
         logger.info("🔴 Disconnecting from peer")
 
-        // Cancel connection gracefully
         connection?.forceCancel()
         connection = nil
+        connectedPeerName = nil
 
         Task { @MainActor in
             self.state = .disconnected
